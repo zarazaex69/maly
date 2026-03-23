@@ -5,16 +5,7 @@ use rug::Float;
 use rug::ops::Pow;
 use std::sync::{Arc, Mutex};
 
-const F64_ZOOM_THRESHOLD: f64 = 1e-13;
 const GPU_ZOOM_THRESHOLD: f64 = 1e-5;
-
-fn required_precision(zoom_width: f64) -> u32 {
-    if zoom_width > F64_ZOOM_THRESHOLD {
-        return 0;
-    }
-    let bits = (-zoom_width.log2() + 32.0).max(128.0) as u32;
-    (bits + 31) & !31
-}
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -64,7 +55,7 @@ impl GpuRenderer {
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("mandelbrot_bgl"),
+            label: Some("bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -90,13 +81,13 @@ impl GpuRenderer {
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mandelbrot_pl"),
+            label: Some("pl"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("mandelbrot_pipeline"),
+            label: Some("pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("main"),
@@ -112,100 +103,189 @@ impl GpuRenderer {
         }
     }
 
-    fn render(
-        &self,
-        center_x: f32,
-        center_y: f32,
-        zoom: f32,
-        max_iter: u32,
-        width: u32,
-        height: u32,
-    ) -> Vec<u8> {
+    fn render(&self, cx: f32, cy: f32, zoom: f32, max_iter: u32, w: u32, h: u32) -> Vec<u8> {
         let params = GpuParams {
-            center_x,
-            center_y,
+            center_x: cx,
+            center_y: cy,
             zoom,
             max_iter,
-            width,
-            height,
+            width: w,
+            height: h,
             _pad0: 0,
             _pad1: 0,
         };
-
-        let param_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("params"),
+        let param_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
             size: std::mem::size_of::<GpuParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.queue
-            .write_buffer(&param_buffer, 0, bytemuck::bytes_of(&params));
+            .write_buffer(&param_buf, 0, bytemuck::bytes_of(&params));
 
-        let pixel_count = (width * height) as u64;
-        let output_size = pixel_count * 4;
-
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("output"),
-            size: output_size,
+        let out_size = (w * h) as u64 * 4;
+        let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: out_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging"),
-            size: output_size,
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: out_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mandelbrot_bg"),
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: param_buffer.as_entire_binding(),
+                    resource: param_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: output_buffer.as_entire_binding(),
+                    resource: out_buf.as_entire_binding(),
                 },
             ],
         });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("mandelbrot_enc"),
-            });
-
+        let mut enc = self.device.create_command_encoder(&Default::default());
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("mandelbrot_pass"),
-                timestamp_writes: None,
-            });
+            let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups((width + 15) / 16, (height + 15) / 16, 1);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((w + 15) / 16, (h + 15) / 16, 1);
         }
-
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        let slice = staging_buffer.slice(..);
+        enc.copy_buffer_to_buffer(&out_buf, 0, &staging, 0, out_size);
+        self.queue.submit(std::iter::once(enc.finish()));
+        let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).unwrap();
         });
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv().unwrap().unwrap();
-
-        let data = slice.get_mapped_range();
-        let result: Vec<u8> = data.to_vec();
-        drop(data);
-        staging_buffer.unmap();
-        result
+        let data = slice.get_mapped_range().to_vec();
+        staging.unmap();
+        data
     }
+}
+
+struct RefOrbit {
+    zx: Vec<f64>,
+    zy: Vec<f64>,
+    escaped_at: u32,
+}
+
+fn compute_reference_orbit(cx: &Float, cy: &Float, max_iter: u32, prec: u32) -> RefOrbit {
+    let mut zx_big = Float::with_val(prec, 0.0);
+    let mut zy_big = Float::with_val(prec, 0.0);
+    let mut tmp = Float::with_val(prec, 0.0);
+    let mut zx2 = Float::with_val(prec, 0.0);
+    let mut zy2 = Float::with_val(prec, 0.0);
+    let bailout = Float::with_val(prec, 1e6);
+
+    let mut orbit_x = Vec::with_capacity(max_iter as usize + 1);
+    let mut orbit_y = Vec::with_capacity(max_iter as usize + 1);
+
+    orbit_x.push(0.0f64);
+    orbit_y.push(0.0f64);
+
+    let mut escaped_at = max_iter;
+
+    for i in 0..max_iter {
+        tmp.assign(&zx_big * &zy_big);
+        zy_big.assign(&tmp * 2.0);
+        zy_big += cy;
+
+        tmp.assign(&zx2 - &zy2);
+        zx_big.assign(&tmp + cx);
+
+        zx2.assign(zx_big.clone().pow(2));
+        zy2.assign(zy_big.clone().pow(2));
+
+        orbit_x.push(zx_big.to_f64());
+        orbit_y.push(zy_big.to_f64());
+
+        tmp.assign(&zx2 + &zy2);
+        if tmp > bailout {
+            escaped_at = i + 1;
+            break;
+        }
+    }
+
+    RefOrbit {
+        zx: orbit_x,
+        zy: orbit_y,
+        escaped_at,
+    }
+}
+
+fn perturbation_iterate(
+    ref_orbit: &RefOrbit,
+    delta_cx: f64,
+    delta_cy: f64,
+    abs_cx: f64,
+    abs_cy: f64,
+    max_iter: u32,
+) -> (u32, f64) {
+    let mut dx = 0.0f64;
+    let mut dy = 0.0f64;
+    let orbit_len = ref_orbit.zx.len();
+
+    for i in 0..max_iter as usize {
+        if i + 1 >= orbit_len {
+            break;
+        }
+
+        let zx = ref_orbit.zx[i];
+        let zy = ref_orbit.zy[i];
+
+        let new_dx = 2.0 * (zx * dx - zy * dy) + dx * dx - dy * dy + delta_cx;
+        let new_dy = 2.0 * (zx * dy + zy * dx) + 2.0 * dx * dy + delta_cy;
+        dx = new_dx;
+        dy = new_dy;
+
+        let full_x = ref_orbit.zx[i + 1] + dx;
+        let full_y = ref_orbit.zy[i + 1] + dy;
+        let mag2 = full_x * full_x + full_y * full_y;
+
+        if mag2 > 4.0 {
+            let smooth = (i as f64) + 1.0 - mag2.sqrt().ln().ln() / std::f64::consts::LN_2;
+            return (i as u32, smooth);
+        }
+
+        let ref_mag2 = zx * zx + zy * zy;
+        if ref_mag2 < dx * dx + dy * dy {
+            return mandelbrot_f64_from(full_x, full_y, abs_cx, abs_cy, max_iter, (i + 1) as u32);
+        }
+    }
+
+    (max_iter, max_iter as f64)
+}
+
+fn mandelbrot_f64_from(
+    mut zx: f64,
+    mut zy: f64,
+    cx: f64,
+    cy: f64,
+    max_iter: u32,
+    start: u32,
+) -> (u32, f64) {
+    let mut zx2 = zx * zx;
+    let mut zy2 = zy * zy;
+    for i in start..max_iter {
+        if zx2 + zy2 > 4.0 {
+            let smooth = (i as f64) + 1.0 - (zx2 + zy2).sqrt().ln().ln() / std::f64::consts::LN_2;
+            return (i, smooth);
+        }
+        zy = 2.0 * zx * zy + cy;
+        zx = zx2 - zy2 + cx;
+        zx2 = zx * zx;
+        zy2 = zy * zy;
+    }
+    (max_iter, max_iter as f64)
 }
 
 fn mandelbrot_f64(cx: f64, cy: f64, max_iter: u32) -> (u32, f64) {
@@ -220,36 +300,7 @@ fn mandelbrot_f64(cx: f64, cy: f64, max_iter: u32) -> (u32, f64) {
         zx2 = zx * zx;
         zy2 = zy * zy;
         if zx2 + zy2 > 4.0 {
-            let modulus = (zx2 + zy2).sqrt();
-            let smooth = (i as f64) + 1.0 - modulus.ln().ln() / std::f64::consts::LN_2;
-            return (i, smooth);
-        }
-        i += 1;
-    }
-    (max_iter, max_iter as f64)
-}
-
-fn mandelbrot_bigfloat(cx: &Float, cy: &Float, max_iter: u32, prec: u32) -> (u32, f64) {
-    let mut zx = Float::with_val(prec, 0.0);
-    let mut zy = Float::with_val(prec, 0.0);
-    let mut zx2 = Float::with_val(prec, 0.0);
-    let mut zy2 = Float::with_val(prec, 0.0);
-    let bailout = Float::with_val(prec, 4.0);
-    let mut tmp = Float::with_val(prec, 0.0);
-
-    let mut i = 0u32;
-    while i < max_iter {
-        tmp.assign(&zx * &zy);
-        zy.assign(&tmp * 2.0);
-        zy += cy;
-        tmp.assign(&zx2 - &zy2);
-        zx.assign(&tmp + cx);
-        zx2.assign(zx.clone().pow(2));
-        zy2.assign(zy.clone().pow(2));
-        tmp.assign(&zx2 + &zy2);
-        if tmp > bailout {
-            let modulus = tmp.to_f64().sqrt();
-            let smooth = (i as f64) + 1.0 - modulus.ln().ln() / std::f64::consts::LN_2;
+            let smooth = (i as f64) + 1.0 - (zx2 + zy2).sqrt().ln().ln() / std::f64::consts::LN_2;
             return (i, smooth);
         }
         i += 1;
@@ -267,19 +318,24 @@ fn iteration_color(smooth_iter: f64, max_iter: u32) -> [u8; 3] {
     [c.r, c.g, c.b]
 }
 
+fn required_precision(zoom_width: f64) -> u32 {
+    let bits = (-zoom_width.log2() + 32.0).max(128.0) as u32;
+    (bits + 31) & !31
+}
+
 enum RenderMode {
     Gpu,
     CpuF64,
-    CpuBigFloat(u32),
+    Perturbation(u32),
 }
 
-fn choose_render_mode(zoom: f64) -> RenderMode {
+fn choose_mode(zoom: f64) -> RenderMode {
     if zoom > GPU_ZOOM_THRESHOLD {
         RenderMode::Gpu
-    } else if zoom > F64_ZOOM_THRESHOLD {
+    } else if zoom > 1e-13 {
         RenderMode::CpuF64
     } else {
-        RenderMode::CpuBigFloat(required_precision(zoom))
+        RenderMode::Perturbation(required_precision(zoom))
     }
 }
 
@@ -303,8 +359,8 @@ struct MandelbrotApp {
     gpu: Arc<GpuRenderer>,
 }
 
-impl Default for MandelbrotApp {
-    fn default() -> Self {
+impl MandelbrotApp {
+    fn new() -> Self {
         Self {
             center_x: Float::with_val(128, -0.5),
             center_y: Float::with_val(128, 0.0),
@@ -318,24 +374,22 @@ impl Default for MandelbrotApp {
             gpu: Arc::new(GpuRenderer::new()),
         }
     }
-}
 
-impl MandelbrotApp {
     fn schedule_render(&mut self, width: usize, height: usize) {
-        let is_rendering_arc = Arc::clone(&self.is_rendering);
         {
-            let mut rendering = is_rendering_arc.lock().unwrap();
-            if *rendering {
+            let mut r = self.is_rendering.lock().unwrap();
+            if *r {
                 return;
             }
-            *rendering = true;
+            *r = true;
         }
 
         let zoom_f64 = self.zoom.to_f64();
-        let mode = choose_render_mode(zoom_f64);
+        let mode = choose_mode(zoom_f64);
         let max_iter = self.max_iter;
         let current_gen = self.generation;
         let result_slot = Arc::clone(&self.render_result);
+        let is_rendering_arc = Arc::clone(&self.is_rendering);
         let cx_f64 = self.center_x.to_f64();
         let cy_f64 = self.center_y.to_f64();
 
@@ -363,31 +417,28 @@ impl MandelbrotApp {
             RenderMode::CpuF64 => {
                 std::thread::spawn(move || {
                     let min_dim = width.min(height) as f64;
-                    let pixel_size = zoom_f64 / min_dim;
-                    let half_w = width as f64 / 2.0;
-                    let half_h = height as f64 / 2.0;
-
+                    let ps = zoom_f64 / min_dim;
+                    let hw = width as f64 / 2.0;
+                    let hh = height as f64 / 2.0;
                     let rows: Vec<Vec<[u8; 3]>> = (0..height)
                         .into_par_iter()
                         .map(|py| {
-                            let world_y = cy_f64 + pixel_size * (py as f64 - half_h);
+                            let wy = cy_f64 + ps * (py as f64 - hh);
                             (0..width)
                                 .map(|px| {
-                                    let world_x = cx_f64 + pixel_size * (px as f64 - half_w);
-                                    let (_, smooth) = mandelbrot_f64(world_x, world_y, max_iter);
-                                    iteration_color(smooth, max_iter)
+                                    let wx = cx_f64 + ps * (px as f64 - hw);
+                                    let (_, s) = mandelbrot_f64(wx, wy, max_iter);
+                                    iteration_color(s, max_iter)
                                 })
                                 .collect()
                         })
                         .collect();
-
                     let mut buf = Vec::with_capacity(width * height * 4);
                     for row in &rows {
                         for &[r, g, b] in row {
                             buf.extend_from_slice(&[r, g, b, 255]);
                         }
                     }
-
                     *result_slot.lock().unwrap() = Some(RenderResult {
                         pixels: buf,
                         width,
@@ -397,30 +448,39 @@ impl MandelbrotApp {
                     *is_rendering_arc.lock().unwrap() = false;
                 });
             }
-            RenderMode::CpuBigFloat(prec) => {
+            RenderMode::Perturbation(prec) => {
                 let cx_big = Float::with_val(prec, &self.center_x);
                 let cy_big = Float::with_val(prec, &self.center_y);
                 let zoom_big = Float::with_val(prec, &self.zoom);
 
                 std::thread::spawn(move || {
+                    let ref_orbit = compute_reference_orbit(&cx_big, &cy_big, max_iter, prec);
+
                     let min_dim = width.min(height) as f64;
-                    let pixel_size = Float::with_val(prec, &zoom_big / min_dim);
-                    let half_w = width as f64 / 2.0;
-                    let half_h = height as f64 / 2.0;
+                    let ps_big = Float::with_val(prec, &zoom_big / min_dim);
+                    let ps_f64 = ps_big.to_f64();
+                    let hw = width as f64 / 2.0;
+                    let hh = height as f64 / 2.0;
+
+                    let cx_f64_abs = cx_big.to_f64();
+                    let cy_f64_abs = cy_big.to_f64();
 
                     let rows: Vec<Vec<[u8; 3]>> = (0..height)
                         .into_par_iter()
                         .map(|py| {
-                            let dy = Float::with_val(prec, &pixel_size * (py as f64 - half_h));
-                            let world_y = Float::with_val(prec, &cy_big + &dy);
+                            let dcy = ps_f64 * (py as f64 - hh);
                             (0..width)
                                 .map(|px| {
-                                    let dx =
-                                        Float::with_val(prec, &pixel_size * (px as f64 - half_w));
-                                    let world_x = Float::with_val(prec, &cx_big + &dx);
-                                    let (_, smooth) =
-                                        mandelbrot_bigfloat(&world_x, &world_y, max_iter, prec);
-                                    iteration_color(smooth, max_iter)
+                                    let dcx = ps_f64 * (px as f64 - hw);
+                                    let (_, s) = perturbation_iterate(
+                                        &ref_orbit,
+                                        dcx,
+                                        dcy,
+                                        cx_f64_abs + dcx,
+                                        cy_f64_abs + dcy,
+                                        max_iter,
+                                    );
+                                    iteration_color(s, max_iter)
                                 })
                                 .collect()
                         })
@@ -432,7 +492,6 @@ impl MandelbrotApp {
                             buf.extend_from_slice(&[r, g, b, 255]);
                         }
                     }
-
                     *result_slot.lock().unwrap() = Some(RenderResult {
                         pixels: buf,
                         width,
@@ -446,17 +505,16 @@ impl MandelbrotApp {
     }
 
     fn zoom_info(&self) -> String {
-        let zoom_f64 = self.zoom.to_f64();
-        let magnification = 3.0 / zoom_f64;
-        let log10 = magnification.log10();
-        let mode = match choose_render_mode(zoom_f64) {
+        let z = self.zoom.to_f64();
+        let mag = 3.0 / z;
+        let mode = match choose_mode(z) {
             RenderMode::Gpu => "GPU f32".to_string(),
             RenderMode::CpuF64 => "CPU f64".to_string(),
-            RenderMode::CpuBigFloat(p) => format!("CPU BigFloat {}bit", p),
+            RenderMode::Perturbation(p) => format!("Perturbation {}bit", p),
         };
         format!(
             "Zoom: 10^{:.1} | Iter: {} | {} | cx: {:.6e} cy: {:.6e}",
-            log10,
+            mag.log10(),
             self.max_iter,
             mode,
             self.center_x.to_f64(),
@@ -467,7 +525,7 @@ impl MandelbrotApp {
 
 impl eframe::App for MandelbrotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("info_panel").show(ctx, |ui| {
+        egui::TopBottomPanel::top("info").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(self.zoom_info());
                 ui.separator();
@@ -476,81 +534,85 @@ impl eframe::App for MandelbrotApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let available = ui.available_size();
-            let w = available.x as usize;
-            let h = available.y as usize;
+            let av = ui.available_size();
+            let w = av.x as usize;
+            let h = av.y as usize;
             if w == 0 || h == 0 {
                 return;
             }
 
-            let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+            let (rect, resp) = ui.allocate_exact_size(av, egui::Sense::click_and_drag());
 
-            if response.dragged_by(egui::PointerButton::Primary) {
-                let delta = response.drag_delta();
-                let prec_bits = required_precision(self.zoom.to_f64());
-                if prec_bits > 0 {
-                    let p = prec_bits.max(128);
-                    let min_dim = w.min(h) as f64;
-                    let pixel_size = Float::with_val(p, &self.zoom / min_dim);
-                    let dx = Float::with_val(p, &pixel_size * (-(delta.x as f64)));
-                    let dy = Float::with_val(p, &pixel_size * (-(delta.y as f64)));
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                let d = resp.drag_delta();
+                let z = self.zoom.to_f64();
+                let prec = if z < 1e-13 {
+                    required_precision(z).max(128)
+                } else {
+                    128
+                };
+                let min_dim = w.min(h) as f64;
+                if prec > 128 {
+                    let ps = Float::with_val(prec, &self.zoom / min_dim);
+                    let dx = Float::with_val(prec, &ps * (-(d.x as f64)));
+                    let dy = Float::with_val(prec, &ps * (-(d.y as f64)));
                     self.center_x += &dx;
                     self.center_y += &dy;
                 } else {
-                    let zoom_f64 = self.zoom.to_f64();
-                    let min_dim = w.min(h) as f64;
-                    let pixel_size = zoom_f64 / min_dim;
-                    self.center_x -= pixel_size * (delta.x as f64);
-                    self.center_y -= pixel_size * (delta.y as f64);
+                    let ps = z / min_dim;
+                    self.center_x -= ps * (d.x as f64);
+                    self.center_y -= ps * (d.y as f64);
                 }
                 self.generation += 1;
             }
 
-            if let Some(hover_pos) = response.hover_pos() {
+            if let Some(hp) = resp.hover_pos() {
                 let scroll = ui.input(|i| i.raw_scroll_delta.y);
                 if scroll.abs() > 0.0 {
                     let factor = if scroll > 0.0 { 0.75 } else { 1.333 };
                     let min_dim = w.min(h) as f64;
-                    let rel_x = (hover_pos.x - rect.center().x) as f64;
-                    let rel_y = (hover_pos.y - rect.center().y) as f64;
-
-                    let prec_bits = required_precision(self.zoom.to_f64());
-                    if prec_bits > 0 {
-                        let p = prec_bits.max(128);
-                        let pixel_size = Float::with_val(p, &self.zoom / min_dim);
-                        let offset_x = Float::with_val(p, &pixel_size * rel_x);
-                        let offset_y = Float::with_val(p, &pixel_size * rel_y);
-                        let world_x = Float::with_val(p, &self.center_x + &offset_x);
-                        let world_y = Float::with_val(p, &self.center_y + &offset_y);
-                        self.zoom *= factor;
-                        let new_ps = Float::with_val(p, &self.zoom / min_dim);
-                        let new_ox = Float::with_val(p, &new_ps * rel_x);
-                        let new_oy = Float::with_val(p, &new_ps * rel_y);
-                        self.center_x = Float::with_val(p, &world_x - &new_ox);
-                        self.center_y = Float::with_val(p, &world_y - &new_oy);
+                    let rx = (hp.x - rect.center().x) as f64;
+                    let ry = (hp.y - rect.center().y) as f64;
+                    let z = self.zoom.to_f64();
+                    let prec = if z < 1e-13 {
+                        required_precision(z).max(128)
                     } else {
-                        let zoom_f64 = self.zoom.to_f64();
-                        let ps = zoom_f64 / min_dim;
-                        let wx = self.center_x.to_f64() + ps * rel_x;
-                        let wy = self.center_y.to_f64() + ps * rel_y;
+                        128
+                    };
+
+                    if prec > 128 {
+                        let ps = Float::with_val(prec, &self.zoom / min_dim);
+                        let ox = Float::with_val(prec, &ps * rx);
+                        let oy = Float::with_val(prec, &ps * ry);
+                        let wx = Float::with_val(prec, &self.center_x + &ox);
+                        let wy = Float::with_val(prec, &self.center_y + &oy);
                         self.zoom *= factor;
-                        let new_ps = self.zoom.to_f64() / min_dim;
-                        self.center_x = Float::with_val(128, wx - new_ps * rel_x);
-                        self.center_y = Float::with_val(128, wy - new_ps * rel_y);
+                        let nps = Float::with_val(prec, &self.zoom / min_dim);
+                        let nox = Float::with_val(prec, &nps * rx);
+                        let noy = Float::with_val(prec, &nps * ry);
+                        self.center_x = Float::with_val(prec, &wx - &nox);
+                        self.center_y = Float::with_val(prec, &wy - &noy);
+                    } else {
+                        let ps = z / min_dim;
+                        let wx = self.center_x.to_f64() + ps * rx;
+                        let wy = self.center_y.to_f64() + ps * ry;
+                        self.zoom *= factor;
+                        let nps = self.zoom.to_f64() / min_dim;
+                        self.center_x = Float::with_val(128, wx - nps * rx);
+                        self.center_y = Float::with_val(128, wy - nps * ry);
                     }
 
-                    let magnification = 3.0 / self.zoom.to_f64();
-                    let log_mag = magnification.log10();
-                    self.max_iter = ((log_mag.abs() * 120.0) as u32 + 256).min(100_000);
+                    let mag = 3.0 / self.zoom.to_f64();
+                    self.max_iter = ((mag.log10().abs() * 120.0) as u32 + 256).min(100_000);
                     self.generation += 1;
                 }
             }
 
             ui.input(|i| {
-                for event in &i.events {
+                for ev in &i.events {
                     if let egui::Event::Key {
                         key, pressed: true, ..
-                    } = event
+                    } = ev
                     {
                         match key {
                             egui::Key::Plus | egui::Key::Equals => {
@@ -562,7 +624,9 @@ impl eframe::App for MandelbrotApp {
                                 self.generation += 1;
                             }
                             egui::Key::R => {
-                                *self = Self::default();
+                                let gpu = Arc::clone(&self.gpu);
+                                *self = Self::new();
+                                self.gpu = gpu;
                             }
                             _ => {}
                         }
@@ -572,14 +636,14 @@ impl eframe::App for MandelbrotApp {
 
             {
                 let mut rg = self.render_result.lock().unwrap();
-                if let Some(result) = rg.take() {
-                    if result.render_gen >= self.rendered_generation {
+                if let Some(r) = rg.take() {
+                    if r.render_gen >= self.rendered_generation {
                         let img = egui::ColorImage::from_rgba_unmultiplied(
-                            [result.width, result.height],
-                            &result.pixels,
+                            [r.width, r.height],
+                            &r.pixels,
                         );
                         self.current_texture = Some(ctx.load_texture(
-                            "mandelbrot",
+                            "m",
                             img,
                             egui::TextureOptions {
                                 magnification: egui::TextureFilter::Linear,
@@ -587,22 +651,25 @@ impl eframe::App for MandelbrotApp {
                                 ..Default::default()
                             },
                         ));
-                        self.rendered_generation = result.render_gen;
+                        self.rendered_generation = r.render_gen;
                     }
                 }
             }
 
             if let Some(tex) = &self.current_texture {
-                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
+                ui.painter().image(
+                    tex.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
             }
 
             if self.generation > self.rendered_generation {
                 self.schedule_render(w, h);
             }
-
-            let is_rendering = *self.is_rendering.lock().unwrap();
-            if is_rendering || self.generation > self.rendered_generation {
+            let busy = *self.is_rendering.lock().unwrap();
+            if busy || self.generation > self.rendered_generation {
                 ctx.request_repaint();
             }
         });
@@ -610,15 +677,14 @@ impl eframe::App for MandelbrotApp {
 }
 
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_title("Mandelbrot Explorer [GPU]"),
-        ..Default::default()
-    };
     eframe::run_native(
         "Mandelbrot Explorer",
-        options,
-        Box::new(|_cc| Ok(Box::new(MandelbrotApp::default()))),
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([1280.0, 800.0])
+                .with_title("Mandelbrot Explorer [GPU+Perturbation]"),
+            ..Default::default()
+        },
+        Box::new(|_| Ok(Box::new(MandelbrotApp::new()))),
     )
 }
