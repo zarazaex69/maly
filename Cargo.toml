@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.31"
+eframe = { version = "0.31", features = ["wgpu"] }
 egui = "0.31"
+egui-wgpu = "0.31"
+wgpu = "24"
 rug = "1.27"
 rayon = "1.10"
-image = "0.25"
 colorous = "1.0"
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "0.4"
 
 [profile.release]
 opt-level = 3
