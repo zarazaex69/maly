@@ -47,7 +47,7 @@ impl GpuRenderer {
         ))
         .expect("No device");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cs"),
+            label: None,
             source: wgpu::ShaderSource::Wgsl(include_str!("gpu.wgsl").into()),
         });
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -201,32 +201,57 @@ fn perturbation_iterate(ref_orbit: &RefOrbit, dcx: f64, dcy: f64, max_iter: u32)
     let mut dx = 0.0f64;
     let mut dy = 0.0f64;
     let olen = ref_orbit.zx.len();
-    let mut n = 0usize;
+    let mut m = 0usize;
 
-    while n < max_iter as usize && n + 1 < olen {
-        let zx = ref_orbit.zx[n];
-        let zy = ref_orbit.zy[n];
-
-        let new_dx = 2.0 * (zx * dx - zy * dy) + dx * dx - dy * dy + dcx;
-        let new_dy = 2.0 * (zx * dy + zy * dx) + 2.0 * dx * dy + dcy;
-        dx = new_dx;
-        dy = new_dy;
-
-        let fx = ref_orbit.zx[n + 1] + dx;
-        let fy = ref_orbit.zy[n + 1] + dy;
-        let mag2 = fx * fx + fy * fy;
-
-        if mag2 > 256.0 {
-            let smooth = (n as f64) + 2.0 - mag2.ln().ln() / std::f64::consts::LN_2;
-            return (n as u32, smooth);
+    for iter in 0..max_iter {
+        if m + 1 >= olen {
+            break;
         }
-
-        if mag2 < dx * dx + dy * dy {
+        let zx = ref_orbit.zx[m];
+        let zy = ref_orbit.zy[m];
+        let ndx = 2.0 * (zx * dx - zy * dy) + dx * dx - dy * dy + dcx;
+        let ndy = 2.0 * (zx * dy + zy * dx) + 2.0 * dx * dy + dcy;
+        dx = ndx;
+        dy = ndy;
+        m += 1;
+        let fx = ref_orbit.zx[m] + dx;
+        let fy = ref_orbit.zy[m] + dy;
+        let mag2 = fx * fx + fy * fy;
+        if mag2 > 256.0 {
+            let smooth = (iter as f64) + 1.0 - mag2.ln().ln() / std::f64::consts::LN_2;
+            return (iter, smooth);
+        }
+        let dmag2 = dx * dx + dy * dy;
+        if mag2 < dmag2 {
             dx = fx;
             dy = fy;
+            m = 0;
         }
+    }
+    (max_iter, max_iter as f64)
+}
 
-        n += 1;
+fn mandelbrot_bigfloat(cx: &Float, cy: &Float, max_iter: u32, prec: u32) -> (u32, f64) {
+    let mut zx = Float::with_val(prec, 0.0);
+    let mut zy = Float::with_val(prec, 0.0);
+    let mut zx2 = Float::with_val(prec, 0.0);
+    let mut zy2 = Float::with_val(prec, 0.0);
+    let mut tmp = Float::with_val(prec, 0.0);
+    let bailout = Float::with_val(prec, 256.0);
+    for i in 0..max_iter {
+        tmp.assign(&zx * &zy);
+        zy.assign(&tmp * 2.0);
+        zy += cy;
+        tmp.assign(&zx2 - &zy2);
+        zx.assign(&tmp + cx);
+        zx2.assign(zx.clone().pow(2));
+        zy2.assign(zy.clone().pow(2));
+        tmp.assign(&zx2 + &zy2);
+        if tmp > bailout {
+            let m2 = tmp.to_f64();
+            let smooth = (i as f64) + 1.0 - m2.ln().ln() / std::f64::consts::LN_2;
+            return (i, smooth);
+        }
     }
     (max_iter, max_iter as f64)
 }
@@ -236,8 +261,7 @@ fn mandelbrot_f64(cx: f64, cy: f64, max_iter: u32) -> (u32, f64) {
     let mut zy = 0.0f64;
     let mut zx2 = 0.0f64;
     let mut zy2 = 0.0f64;
-    let mut i = 0u32;
-    while i < max_iter {
+    for i in 0..max_iter {
         zy = 2.0 * zx * zy + cy;
         zx = zx2 - zy2 + cx;
         zx2 = zx * zx;
@@ -246,18 +270,17 @@ fn mandelbrot_f64(cx: f64, cy: f64, max_iter: u32) -> (u32, f64) {
             let smooth = (i as f64) + 1.0 - (zx2 + zy2).ln().ln() / std::f64::consts::LN_2;
             return (i, smooth);
         }
-        i += 1;
     }
     (max_iter, max_iter as f64)
 }
 
-fn iteration_color(smooth_iter: f64, max_iter: u32) -> [u8; 3] {
+fn iteration_color(smooth_iter: f64, max_iter: u32) -> [u8; 4] {
     if smooth_iter >= max_iter as f64 {
-        return [0, 0, 0];
+        return [0, 0, 0, 255];
     }
     let t = (smooth_iter * 0.015).fract();
     let c = colorous::TURBO.eval_continuous(t);
-    [c.r, c.g, c.b]
+    [c.r, c.g, c.b, 255]
 }
 
 fn required_precision(zoom_width: f64) -> u32 {
@@ -270,7 +293,6 @@ enum RenderMode {
     CpuF64,
     Perturbation(u32),
 }
-
 fn choose_mode(zoom: f64) -> RenderMode {
     if zoom > GPU_ZOOM_THRESHOLD {
         RenderMode::Gpu
@@ -361,25 +383,18 @@ impl MandelbrotApp {
                     let ps = zoom_f64 / md;
                     let hw = width as f64 / 2.0;
                     let hh = height as f64 / 2.0;
-                    let rows: Vec<Vec<[u8; 3]>> = (0..height)
-                        .into_par_iter()
-                        .map(|py| {
-                            let wy = cyf + ps * (py as f64 - hh);
-                            (0..width)
-                                .map(|px| {
-                                    let wx = cxf + ps * (px as f64 - hw);
-                                    let (_, s) = mandelbrot_f64(wx, wy, max_iter);
-                                    iteration_color(s, max_iter)
-                                })
-                                .collect()
-                        })
-                        .collect();
-                    let mut buf = Vec::with_capacity(width * height * 4);
-                    for row in &rows {
-                        for &[r, g, b] in row {
-                            buf.extend_from_slice(&[r, g, b, 255]);
+                    let mut buf = vec![0u8; width * height * 4];
+                    let chunks: Vec<(usize, &mut [u8])> =
+                        buf.chunks_exact_mut(width * 4).enumerate().collect();
+                    chunks.into_par_iter().for_each(|(py, row)| {
+                        let wy = cyf + ps * (py as f64 - hh);
+                        for px in 0..width {
+                            let wx = cxf + ps * (px as f64 - hw);
+                            let (_, s) = mandelbrot_f64(wx, wy, max_iter);
+                            let c = iteration_color(s, max_iter);
+                            row[px * 4..px * 4 + 4].copy_from_slice(&c);
                         }
-                    }
+                    });
                     *rs.lock().unwrap() = Some(RenderResult {
                         pixels: buf,
                         width,
@@ -400,33 +415,26 @@ impl MandelbrotApp {
                     let hw = width as f64 / 2.0;
                     let hh = height as f64 / 2.0;
 
-                    let dcx: Vec<f64> = (0..width)
+                    let dcx_arr: Vec<f64> = (0..width)
                         .map(|px| Float::with_val(prec, &psb * (px as f64 - hw)).to_f64())
                         .collect();
-                    let dcy: Vec<f64> = (0..height)
+                    let dcy_arr: Vec<f64> = (0..height)
                         .map(|py| Float::with_val(prec, &psb * (py as f64 - hh)).to_f64())
                         .collect();
 
-                    let rows: Vec<Vec<[u8; 3]>> = (0..height)
-                        .into_par_iter()
-                        .map(|py| {
-                            let dy = dcy[py];
-                            (0..width)
-                                .map(|px| {
-                                    let dx = dcx[px];
-                                    let (_, s) = perturbation_iterate(&refo, dx, dy, max_iter);
-                                    iteration_color(s, max_iter)
-                                })
-                                .collect()
-                        })
-                        .collect();
-
-                    let mut buf = Vec::with_capacity(width * height * 4);
-                    for row in &rows {
-                        for &[r, g, b] in row {
-                            buf.extend_from_slice(&[r, g, b, 255]);
+                    let mut buf = vec![0u8; width * height * 4];
+                    let chunks: Vec<(usize, &mut [u8])> =
+                        buf.chunks_exact_mut(width * 4).enumerate().collect();
+                    chunks.into_par_iter().for_each(|(py, row)| {
+                        let dy = dcy_arr[py];
+                        for px in 0..width {
+                            let dx = dcx_arr[px];
+                            let (_, s) = perturbation_iterate(&refo, dx, dy, max_iter);
+                            let c = iteration_color(s, max_iter);
+                            row[px * 4..px * 4 + 4].copy_from_slice(&c);
                         }
-                    }
+                    });
+
                     *rs.lock().unwrap() = Some(RenderResult {
                         pixels: buf,
                         width,
@@ -478,9 +486,8 @@ impl eframe::App for MandelbrotApp {
 
             if resp.dragged_by(egui::PointerButton::Primary) {
                 let d = resp.drag_delta();
-                let z = self.zoom.to_f64();
+                let prec = required_precision(self.zoom.to_f64()).max(128);
                 let md = w.min(h) as f64;
-                let prec = required_precision(z).max(128);
                 let ps = Float::with_val(prec, &self.zoom / md);
                 let fdx = Float::with_val(prec, &ps * (-(d.x as f64)));
                 let fdy = Float::with_val(prec, &ps * (-(d.y as f64)));
